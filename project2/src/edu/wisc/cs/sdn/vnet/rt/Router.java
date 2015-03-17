@@ -3,8 +3,10 @@ package edu.wisc.cs.sdn.vnet.rt;
 import edu.wisc.cs.sdn.vnet.Device;
 import edu.wisc.cs.sdn.vnet.DumpFile;
 import edu.wisc.cs.sdn.vnet.Iface;
-
+import net.floodlightcontroller.packet.Data;
 import net.floodlightcontroller.packet.Ethernet;
+import net.floodlightcontroller.packet.ICMP;
+import net.floodlightcontroller.packet.IPacket;
 import net.floodlightcontroller.packet.IPv4;
 
 /**
@@ -119,7 +121,73 @@ public class Router extends Device
         // Check TTL
         ipPacket.setTtl((byte)(ipPacket.getTtl()-1));
         if (0 == ipPacket.getTtl())
-        { return; }
+        { 
+        	//send ICMP Time Exceeded message
+        	Ethernet ether = new Ethernet();
+        	IPv4 ip = new IPv4();
+        	ICMP icmp = new ICMP();
+        	Data data = new Data();
+        	
+        	//Link the headers together
+        	ether.setPayload(ip);
+        	ip.setPayload(icmp);
+        	icmp.setPayload(data);
+        
+        	////Find destination MAC
+        	// Get IP header
+    		IPv4 ipacket = (IPv4)etherPacket.getPayload();
+            int dstAddr = ipacket.getDestinationAddress();
+
+            // Find matching route table entry 
+            RouteEntry bestMatch = this.routeTable.lookup(dstAddr);
+
+            // If no entry matched, do nothing
+            if (null == bestMatch)
+            { return; }
+            
+            // If no gateway, then nextHop is IP destination
+            int nextHop = bestMatch.getGatewayAddress();
+            if (0 == nextHop)
+            { nextHop = dstAddr; }
+
+            // Set destination MAC address in Ethernet header
+            ArpEntry arpEntry = this.arpCache.lookup(nextHop);
+            if (null == arpEntry)
+            { return; }
+
+            //Update Ethernet header
+            ether.setEtherType(Ethernet.TYPE_IPv4);
+        	ether.setSourceMACAddress(inIface.getMacAddress().toString());
+        	ether.setDestinationMACAddress(arpEntry.getMac().toString());
+        	
+        	//Update IP header
+        	ip.setTtl((byte) 64);
+        	ip.setProtocol(IPv4.PROTOCOL_ICMP);
+        	ip.setSourceAddress(inIface.getIpAddress());
+        	ip.setDestinationAddress(ipPacket.getSourceAddress());
+        	
+        	//Update ICMP header
+        	icmp.setIcmpCode((byte) 0);
+        	icmp.setIcmpType((byte) 11);
+        	
+        	//Updata the data
+        	byte headerLength = ipPacket.getHeaderLength();
+        	byte ipInfo[] = ipPacket.serialize();
+        	byte padding[] = {0, 0, 0, 0}; 
+        	byte dataPayload[] = new byte[padding.length + headerLength + 8];
+        	for(int i = 0; i < dataPayload.length; i++){
+        		if(i < padding.length){
+        			dataPayload[i] = padding[i];
+        		}
+        		else{
+        			dataPayload[i] = ipInfo[i-padding.length];
+        		}
+        	}
+        	data.setData(dataPayload);
+        	
+        	sendPacket(ether, inIface);
+        	return; 
+        }
         
         // Reset checksum now that TTL is decremented
         ipPacket.resetChecksum();
