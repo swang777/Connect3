@@ -1,7 +1,11 @@
 package edu.wisc.cs.sdn.vnet.rt;
 
 import java.nio.ByteBuffer;
-import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Timer;
+import java.util.TimerTask;
 
 import edu.wisc.cs.sdn.vnet.Device;
 import edu.wisc.cs.sdn.vnet.DumpFile;
@@ -21,12 +25,16 @@ public class Router extends Device
 	public static final byte TYPE_TIME_EXCEEDED = 11;
 	public static final byte TYPE_DESTINATION_UNREACHABLE = 3;
 	public static final byte TYPE_ECHO_REPLY = 0;
-	
+	public static final byte BROADCAST[] = {127, 127, 127, 127, 127, 127};
 	public static final byte CODE_TIME_EXCEEDED = 0;
 	public static final byte CODE_NET_UNREACHABLE = 0;
 	public static final byte CODE_HOST_UNREACHABLE = 1;
 	public static final byte CODE_PORT_UNREACHABLE = 3;
 	public static final byte CODE_ECHO_REPLY = 0;
+	
+	Timer timer;
+	
+	Map<Integer, UnknownQueue> map = new HashMap<Integer, UnknownQueue>();
 	
 	/** Routing table for the router */
 	private RouteTable routeTable;
@@ -160,6 +168,102 @@ public class Router extends Device
 		}
 	}
 
+    private void handleArpCacheMiss(RouteEntry bestMatch, Ethernet etherPacket, Iface inIface, IPv4 ipkt) {
+    	
+		// If our map already has the destination address in it add message to queue
+		if(map.containsKey(ipkt.getDestinationAddress())){
+			// We need to add the message to our queue
+			UnknownQueue unknownHost = map.get(ipkt.getDestinationAddress());
+			unknownHost.getQueue().add(etherPacket);
+		}
+		//generate ARP request and broadcast it on all non-incoming interfaces
+		else{
+			int timeBeforeResend = 1000; // 1 second
+	    	Ethernet arpRequest = generateArpRequestPacket(ipkt, inIface);
+			
+			/*Construct new object*/
+			ARPTask sendARPTask = new ARPTask(arpRequest, inIface, ipkt.getDestinationAddress());
+			UnknownQueue unknownHostInfo = new UnknownQueue(etherPacket, sendARPTask);
+			
+			//get destination IP and add the corresponding UnknownQueue to the map
+			map.put(ipkt.getDestinationAddress(), unknownHostInfo);
+			
+			//Schedule the task to go off in 1 second
+			timer.schedule(sendARPTask, timeBeforeResend, timeBeforeResend);
+
+			//still have to actually broadcast everywhere. VERIFY THIS WORKS
+			broadcastARPPacket(arpRequest, inIface, ipkt.getDestinationAddress());	
+		}
+	}
+    
+    private Ethernet generateArpRequestPacket(IPv4 ipkt, Iface inIface) {
+    	Ethernet ether = new Ethernet();
+		ARP arp = new ARP();
+
+		//link the headers together
+		ether.setPayload(arp);
+		
+		//Ethernet Header
+		ether.setEtherType(Ethernet.TYPE_ARP);
+		ether.setSourceMACAddress(inIface.getMacAddress().toBytes());
+		ether.setDestinationMACAddress(BROADCAST);
+
+		//ARP Header
+		arp.setHardwareType(ARP.HW_TYPE_ETHERNET);
+		arp.setProtocolType(ARP.PROTO_TYPE_IP);
+		arp.setHardwareAddressLength((byte)Ethernet.DATALAYER_ADDRESS_LENGTH);
+		arp.setProtocolAddressLength((byte) 4);
+		arp.setOpCode(ARP.OP_REQUEST);
+		
+		//sender
+		arp.setSenderHardwareAddress(inIface.getMacAddress().toBytes());
+		arp.setSenderProtocolAddress(inIface.getIpAddress());
+		
+		//target
+		byte unknown[] = {0, 0, 0, 0, 0, 0};
+		arp.setTargetHardwareAddress(unknown);
+		arp.setTargetProtocolAddress(ipkt.getDestinationAddress());
+		
+		ether.resetChecksum();
+		
+		return ether;
+	}
+
+	private void broadcastARPPacket(Ethernet arpRequestPacket, Iface inIface, int dstIP){
+		UnknownQueue unknownHost = map.get(dstIP);
+    	// Send the message up to 3 times
+    	if(unknownHost.getTimesSent() < 3){
+    		unknownHost.incrementTimesSent();
+    		Iface port;
+    		Map<String, Iface> interfaces = this.getInterfaces();
+    		for(Map.Entry<String, Iface> item : interfaces.entrySet()){
+    			port = item.getValue();
+    			/*We don't want to send back to the interface that sent us 
+    			 *the packet*/
+    			if(!(port.equals(inIface))){
+    				sendPacket(arpRequestPacket, port);
+    			}	
+    		}
+    	}
+    	// If it has already been sent 3 times, don't reschedule the timer
+    	else{
+    		IPv4 ipPacket;
+    		//cancel timertask
+    		unknownHost.getArpTask().cancel();
+    		//purge timer
+    		timer.purge();
+    		//flush queue //send dst host unreachable
+    		Queue<Ethernet> messages = unknownHost.getQueue();
+    		for(Ethernet msg : messages){
+    			ipPacket = (IPv4) msg.getPayload();
+    			sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, msg, inIface, ipPacket);
+    			messages.remove();
+    		}
+    		//remove dstIP from map
+    		map.remove(unknownHost);
+    	}
+    }
+	
 	private void handleIpPacket(Ethernet etherPacket, Iface inIface)
 	{
 		// Make sure it's an IP packet
@@ -253,7 +357,11 @@ public class Router extends Device
         ArpEntry arpEntry = this.arpCache.lookup(nextHop);
         if (null == arpEntry)
         { 
-        	sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, etherPacket, inIface, ipPacket);
+        	/* This is temporarily commented out so that we can send an arp request
+        	 * sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, etherPacket, inIface, ipPacket);
+        	 */
+        	//Also need to do some sort of queueing per IP addr
+        	handleArpCacheMiss(bestMatch, etherPacket, inIface, ipPacket);
         	return; 
         }
         etherPacket.setDestinationMACAddress(arpEntry.getMac().toBytes());
@@ -261,7 +369,7 @@ public class Router extends Device
         this.sendPacket(etherPacket, outIface);
     }
     
-    private void sendICMPmessage(byte type, byte code, Ethernet etherPacket, Iface inIface, IPv4 ipPacket){
+	private void sendICMPmessage(byte type, byte code, Ethernet etherPacket, Iface inIface, IPv4 ipPacket){
     	//send ICMP Time Exceeded message
     	Ethernet ether = new Ethernet();
     	IPv4 ip = new IPv4();
@@ -336,4 +444,21 @@ public class Router extends Device
     	ether.resetChecksum();
     	sendPacket(ether, inIface);
     }
+
+	class ARPTask extends TimerTask {
+		private Ethernet ether;
+		private Iface inIface;
+		private int dstIP;
+		
+		public ARPTask(Ethernet ePacket, Iface iface, int ip){
+			ether = ePacket;
+			inIface = iface;
+			dstIP = ip;
+		}
+		@Override
+		public void run() {
+			System.out.println("Resend ARP Request");
+			broadcastARPPacket(ether, inIface, dstIP);
+		}
+	}
 }
