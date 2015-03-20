@@ -32,7 +32,7 @@ public class Router extends Device
 	public static final byte CODE_PORT_UNREACHABLE = 3;
 	public static final byte CODE_ECHO_REPLY = 0;
 	
-	Timer timer;
+	Timer timer = new Timer();
 	
 	Map<Integer, UnknownQueue> map = new HashMap<Integer, UnknownQueue>();
 	
@@ -173,6 +173,7 @@ public class Router extends Device
 		// If our map already has the destination address in it add message to queue
 		if(map.containsKey(ipkt.getDestinationAddress())){
 			// We need to add the message to our queue
+			System.out.println("Adding new message to existing queue");
 			UnknownQueue unknownHost = map.get(ipkt.getDestinationAddress());
 			unknownHost.getQueue().add(etherPacket);
 		}
@@ -254,11 +255,16 @@ public class Router extends Device
     		timer.purge();
     		//flush queue //send dst host unreachable
     		Queue<Ethernet> messages = unknownHost.getQueue();
+    		System.out.println("size of queue" + messages.size());
+    		//Ethernet msg;
     		for(Ethernet msg : messages){
+    		//for(int i = 0; i < messages.size(); i++){
+    			//msg = messages.remove();
     			ipPacket = (IPv4) msg.getPayload();
     			sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, msg, inIface, ipPacket);
-    			messages.remove();
+    			System.out.println("SEND ICMP MSG");
     		}
+    		System.out.println("we sent all the messages in the queue!!! woohooo!");
     		//remove dstIP from map
     		map.remove(unknownHost);
     	}
@@ -357,9 +363,9 @@ public class Router extends Device
         ArpEntry arpEntry = this.arpCache.lookup(nextHop);
         if (null == arpEntry)
         { 
-        	/* This is temporarily commented out so that we can send an arp request
-        	 * sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, etherPacket, inIface, ipPacket);
-        	 */
+        	// This is temporarily commented out so that we can send an arp request
+        	//sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, etherPacket, inIface, ipPacket);
+        	 //
         	//Also need to do some sort of queueing per IP addr
         	handleArpCacheMiss(bestMatch, etherPacket, inIface, ipPacket);
         	return; 
@@ -400,8 +406,17 @@ public class Router extends Device
         //Update Ethernet header
         ether.setEtherType(Ethernet.TYPE_IPv4);
     	ether.setSourceMACAddress(inIface.getMacAddress().toBytes());
-    	ether.setDestinationMACAddress(arpEntry.getMac().toBytes());
     	
+        // this is the case for Arp Request timeout
+        if(arpEntry == null){
+        	//ether.setDestinationMACAddress(inIface.getMacAddress().toBytes());
+        	ether.setDestinationMACAddress(etherPacket.getSourceMAC().toBytes());
+        	System.out.println("We have a null arp entry");
+        }
+        else{
+        	ether.setDestinationMACAddress(arpEntry.getMac().toBytes());
+        }
+        
     	//Update IP header
     	ip.setTtl((byte) 64);
     	ip.setProtocol(IPv4.PROTOCOL_ICMP);
@@ -442,7 +457,9 @@ public class Router extends Device
     	icmp.resetChecksum();
     	ip.resetChecksum();
     	ether.resetChecksum();
+    	System.out.println("send ICMP Packet");
     	sendPacket(ether, inIface);
+    	System.out.println("ICMP sent!!");
     }
 
 	class ARPTask extends TimerTask {

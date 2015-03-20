@@ -33,5 +33,4 @@ public class UnknownQueue {
 	public ARPTask getArpTask(){
 		return arpTask;
 	}
-	
 }
