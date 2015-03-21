@@ -18,6 +18,9 @@ import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.ICMP;
 import net.floodlightcontroller.packet.IPv4;
 import net.floodlightcontroller.packet.MACAddress;
+import net.floodlightcontroller.packet.RIPv2;
+import net.floodlightcontroller.packet.RIPv2Entry;
+import net.floodlightcontroller.packet.UDP;
 
 /**
  * @author Aaron Gember-Jacobson and Anubhavnidhi Abhashkumar
@@ -66,6 +69,19 @@ public class Router extends Device
 		//at router start, add entries for what is directly reachable
 			//subnets can be determined based on the ip addr and netmask associated with each interface
 			//these entries have no gateway
+		Ethernet ether = new Ethernet();
+		UDP udp = new UDP();
+		RIPv2 rip = new RIPv2();
+		RIPv2Entry ripEntry = new RIPv2Entry();
+		
+		ether.setPayload(udp);
+		udp.setPayload(rip);
+		
+		ether.setDestinationMACAddress(BROADCAST);
+		
+		udp.setSourcePort(UDP.RIP_PORT);
+		udp.setDestinationPort(UDP.RIP_PORT);
+		
 	}
 
 	/**
