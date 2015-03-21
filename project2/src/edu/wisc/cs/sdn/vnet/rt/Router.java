@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ConcurrentHashMap;
 
 import edu.wisc.cs.sdn.vnet.Device;
 import edu.wisc.cs.sdn.vnet.DumpFile;
@@ -36,7 +37,7 @@ public class Router extends Device
 
 	Timer timer = new Timer();
 
-	Map<Integer, UnknownQueue> map = new HashMap<Integer, UnknownQueue>();
+	Map<Integer, UnknownQueue> map = new ConcurrentHashMap<Integer, UnknownQueue>();
 
 	/** Routing table for the router */
 	private RouteTable routeTable;
@@ -60,6 +61,16 @@ public class Router extends Device
 	 */
 	public RouteTable getRouteTable()
 	{ return this.routeTable; }
+	
+	
+	public void runRipv2(){
+		//at router start, add entries for what is directly reachable
+			//subnets can be determined based on the ip addr and netmask associated with each interface
+			//these entries have no gateway
+		
+		
+		
+	}
 
 	/**
 	 * Load a new routing table from a file.
@@ -110,7 +121,6 @@ public class Router extends Device
 				etherPacket.toString().replace("\n", "\n\t"));
 
 		/********************************************************************/
-		/* TODO: Handle packets                                             */
 
 		switch(etherPacket.getEtherType())
 		{
@@ -133,7 +143,6 @@ public class Router extends Device
 		int targetIp = ByteBuffer.wrap(arpPacket.getTargetProtocolAddress()).getInt();
 
 		// Make sure it's an ARP Request
-		System.out.println("Handling ARP Packet");
 		if (arpPacket.getOpCode() == ARP.OP_REQUEST){
 			System.out.println("We have an ARP Request");
 			// Only respond to ARP requests whose target IP equals IP of 
@@ -183,6 +192,7 @@ public class Router extends Device
 			}
 		}
 		else if( arpPacket.getOpCode() == ARP.OP_REPLY){
+			System.out.println("ARP Reply");
 			boolean foundTarget = false;
 			Iface iface;
 			Map<String, Iface> interfaces = this.getInterfaces();
@@ -204,35 +214,23 @@ public class Router extends Device
 
 				//dequeue the packets and enter the destination MAC
 				UnknownQueue foundHost = map.get(dstIP);
-
-				//cancel any pending arp timer tasks since we got the information we needed
-				foundHost.getArpTask().cancel();
-				//remove the scheduled tasks from the timer
-				timer.purge();
-				//send all of the stored messages that are destined for the newly found host
-				Queue<Ethernet> messages = foundHost.getQueue();
-				for(Ethernet msg : messages){
-					System.out.println("We found the host! Send some packets!");
-					msg.setDestinationMACAddress(dstMAC.toBytes());
-					sendPacket(msg, inIface);
+				if(foundHost != null){
+					//cancel any pending arp timer tasks since we got the information we needed
+					foundHost.getArpTask().cancel();
+					//remove the scheduled tasks from the timer
+					timer.purge();
+					//send all of the stored messages that are destined for the newly found host
+					Queue<Ethernet> messages = foundHost.getQueue();
+					for(Ethernet msg : messages){
+						System.out.println("We found the host! Send some packets!");
+						msg.setDestinationMACAddress(dstMAC.toBytes());
+						sendPacket(msg, inIface);
+					}
+					map.remove(dstIP);	
 				}
-				map.remove(dstIP);	
 			}
 			else{
-				//table lookup and forward on that iFace
-				//arp reply dst protocol -> look up which iFace
-				// Find matching route table entry 
-				RouteEntry bestMatch = this.routeTable.lookup(targetIp);
-				if(bestMatch != null){
-					// Make sure we don't sent a packet back out the interface it came in
-					Iface outIface = bestMatch.getInterface();
-					if (outIface == inIface)
-					{ return; }
-
-					// Set source MAC address in Ethernet header
-					etherPacket.setSourceMACAddress(outIface.getMacAddress().toBytes());
-					this.sendPacket(etherPacket, outIface);
-				} 
+				forwardARPPacket(etherPacket, targetIp);
 			}
 		}
 	}
@@ -262,7 +260,7 @@ public class Router extends Device
 			timer.schedule(sendARPTask, timeBeforeResend, timeBeforeResend);
 
 			//still have to actually broadcast everywhere. VERIFY THIS WORKS
-			broadcastARPPacket(arpRequest, inIface, ipkt.getDestinationAddress());	
+			forwardARPPacket(arpRequest, ipkt.getDestinationAddress());	
 		}
 	}
 
@@ -299,22 +297,24 @@ public class Router extends Device
 		return ether;
 	}
 	
+	private void forwardARPPacket(Ethernet etherPacket, int targetIp){
+		RouteEntry bestMatch = this.routeTable.lookup(targetIp);
+		if(bestMatch != null){
+			// Make sure we don't sent a packet back out the interface it came in
+			Iface outIface = bestMatch.getInterface();
+			
+			// Set source MAC address in Ethernet header
+			etherPacket.setSourceMACAddress(outIface.getMacAddress().toBytes());
+			this.sendPacket(etherPacket, outIface);
+		} 
+	}
 
-	private void broadcastARPPacket(Ethernet arpRequestPacket, Iface inIface, int dstIP){
+	private void checkIfContinueTryingToSendArpPacket(Ethernet arpRequestPacket, Iface inIface, int dstIP){
 		UnknownQueue unknownHost = map.get(dstIP);
 		// Send the message up to 3 times
 		if(unknownHost.getTimesSent() < 3){
 			unknownHost.incrementTimesSent();
-			Iface port;
-			Map<String, Iface> interfaces = this.getInterfaces();
-			for(Map.Entry<String, Iface> item : interfaces.entrySet()){
-				port = item.getValue();
-				/*We don't want to send back to the interface that sent us 
-				 *the packet*/
-				if(!(port.equals(inIface))){
-					sendPacket(arpRequestPacket, port);
-				}	
-			}
+			forwardARPPacket(arpRequestPacket, dstIP);
 		}
 		// If it has already been sent 3 times, don't reschedule the timer
 		else{
@@ -538,16 +538,18 @@ public class Router extends Device
 		private Iface inIface;
 		private int dstIP;
 
-		public ARPTask(Ethernet ePacket, Iface iface, int ip){
+		public ARPTask(Ethernet ePacket, Iface i, int ip){
 			ether = ePacket;
-			inIface = iface;
 			dstIP = ip;
+			inIface = i;
 		}
 		@Override
 		public void run() {
 			System.out.println("Resend ARP Request");
-			broadcastARPPacket(ether, inIface, dstIP);
+			checkIfContinueTryingToSendArpPacket(ether, inIface, dstIP);
 		}
 	}
 }
+
+
 }
