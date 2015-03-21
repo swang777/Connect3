@@ -62,14 +62,10 @@ public class Router extends Device
 	public RouteTable getRouteTable()
 	{ return this.routeTable; }
 	
-	
 	public void runRipv2(){
 		//at router start, add entries for what is directly reachable
 			//subnets can be determined based on the ip addr and netmask associated with each interface
 			//these entries have no gateway
-		
-		
-		
 	}
 
 	/**
@@ -177,65 +173,36 @@ public class Router extends Device
 				ether.resetChecksum();
 				sendPacket(ether, inIface);
 			}
-			else{
-				//send on all interfaces excluding the inIface
-				Iface port;
-				Map<String, Iface> interfaces = this.getInterfaces();
-				for(Map.Entry<String, Iface> item : interfaces.entrySet()){
-					port = item.getValue();
-					/*We don't want to send back to the interface that sent us 
-					 *the packet*/
-					if(!(port.equals(inIface))){
-						sendPacket(etherPacket, port);
-					}	
-				}
-			}
 		}
 		else if( arpPacket.getOpCode() == ARP.OP_REPLY){
 			System.out.println("ARP Reply");
-			boolean foundTarget = false;
-			Iface iface;
-			Map<String, Iface> interfaces = this.getInterfaces();
-			for(Map.Entry<String, Iface> item : interfaces.entrySet()){
-				iface = item.getValue();
-				/*We don't want to send back to the interface that sent us 
-				 *the packet*/
-				if(iface.getIpAddress() == targetIp){
-					foundTarget = true;
-				}	
-			}
-			if(foundTarget){
-				System.out.println("do we find the targetIP?");
-				int dstIP = IPv4.toIPv4Address(arpPacket.getSenderProtocolAddress());
-				MACAddress dstMAC = MACAddress.valueOf(arpPacket.getSenderHardwareAddress());
 
-				// insert arpCache entry for the corresponding ARP reply
-				arpCache.insert(dstMAC, dstIP);
+			int dstIP = IPv4.toIPv4Address(arpPacket.getSenderProtocolAddress());
+			MACAddress dstMAC = MACAddress.valueOf(arpPacket.getSenderHardwareAddress());
 
-				//dequeue the packets and enter the destination MAC
-				UnknownQueue foundHost = map.get(dstIP);
-				if(foundHost != null){
-					//cancel any pending arp timer tasks since we got the information we needed
-					foundHost.getArpTask().cancel();
-					//remove the scheduled tasks from the timer
-					timer.purge();
-					//send all of the stored messages that are destined for the newly found host
-					Queue<Ethernet> messages = foundHost.getQueue();
-					for(Ethernet msg : messages){
-						System.out.println("We found the host! Send some packets!");
-						msg.setDestinationMACAddress(dstMAC.toBytes());
-						sendPacket(msg, inIface);
-					}
-					map.remove(dstIP);	
+			// insert arpCache entry for the corresponding ARP reply
+			arpCache.insert(dstMAC, dstIP);
+
+			//dequeue the packets and enter the destination MAC
+			UnknownQueue foundHost = map.get(dstIP);
+			if(foundHost != null){
+				//cancel any pending arp timer tasks since we got the information we needed
+				foundHost.getArpTask().cancel();
+				//remove the scheduled tasks from the timer
+				timer.purge();
+				//send all of the stored messages that are destined for the newly found host
+				Queue<Ethernet> messages = foundHost.getQueue();
+				for(Ethernet msg : messages){
+					System.out.println("We found the host! Send some packets!");
+					msg.setDestinationMACAddress(dstMAC.toBytes());
+					sendPacket(msg, this.getOutIface(msg));
 				}
-			}
-			else{
-				forwardARPPacket(etherPacket, targetIp);
+				map.remove(dstIP);	
 			}
 		}
 	}
 
-	private void handleArpCacheMiss(Ethernet etherPacket, Iface inIface, IPv4 ipkt) {
+	private void handleArpCacheMiss(RouteEntry bestMatch, int nextHop, Ethernet etherPacket, Iface inIface, IPv4 ipkt) {
 
 		// If our map already has the destination address in it add message to queue
 		if(map.containsKey(ipkt.getDestinationAddress())){
@@ -247,10 +214,10 @@ public class Router extends Device
 		//generate ARP request and broadcast it on all non-incoming interfaces
 		else{
 			int timeBeforeResend = 1000; // 1 second
-			Ethernet arpRequest = generateArpRequestPacket(ipkt, inIface);
+			Ethernet arpRequest = generateArpRequestPacket(nextHop, inIface);
 
 			/*Construct new object*/
-			ARPTask sendARPTask = new ARPTask(arpRequest, inIface, ipkt.getDestinationAddress());
+			ARPTask sendARPTask = new ARPTask(arpRequest, bestMatch.getInterface() , ipkt.getDestinationAddress());
 			UnknownQueue unknownHostInfo = new UnknownQueue(etherPacket, sendARPTask);
 
 			//get destination IP and add the corresponding UnknownQueue to the map
@@ -259,12 +226,11 @@ public class Router extends Device
 			//Schedule the task to go off in 1 second
 			timer.schedule(sendARPTask, timeBeforeResend, timeBeforeResend);
 
-			//still have to actually broadcast everywhere. VERIFY THIS WORKS
-			forwardARPPacket(arpRequest, ipkt.getDestinationAddress());	
+			sendPacket(arpRequest, bestMatch.getInterface());
 		}
 	}
 
-	private Ethernet generateArpRequestPacket(IPv4 ipkt, Iface inIface) {
+	private Ethernet generateArpRequestPacket(int nextHop, Iface inIface) {
 		Ethernet ether = new Ethernet();
 		ARP arp = new ARP();
 
@@ -274,6 +240,7 @@ public class Router extends Device
 		//Ethernet Header
 		ether.setEtherType(Ethernet.TYPE_ARP);
 		ether.setSourceMACAddress(inIface.getMacAddress().toBytes());
+		//ether.setSourceMACAddress(bestMatch.getInterface().getMacAddress().toBytes());
 		ether.setDestinationMACAddress(BROADCAST);
 
 		//ARP Header
@@ -290,31 +257,19 @@ public class Router extends Device
 		//target
 		byte unknown[] = {0, 0, 0, 0, 0, 0};
 		arp.setTargetHardwareAddress(unknown);
-		arp.setTargetProtocolAddress(ipkt.getDestinationAddress());
+		arp.setTargetProtocolAddress(nextHop);
 
 		ether.resetChecksum();
 
 		return ether;
 	}
 	
-	private void forwardARPPacket(Ethernet etherPacket, int targetIp){
-		RouteEntry bestMatch = this.routeTable.lookup(targetIp);
-		if(bestMatch != null){
-			// Make sure we don't sent a packet back out the interface it came in
-			Iface outIface = bestMatch.getInterface();
-			
-			// Set source MAC address in Ethernet header
-			etherPacket.setSourceMACAddress(outIface.getMacAddress().toBytes());
-			this.sendPacket(etherPacket, outIface);
-		} 
-	}
-
-	private void checkIfContinueTryingToSendArpPacket(Ethernet arpRequestPacket, Iface inIface, int dstIP){
+	private void checkIfContinueTryingToSendArpPacket(Ethernet arpRequestPacket, Iface outIface, int dstIP){
 		UnknownQueue unknownHost = map.get(dstIP);
 		// Send the message up to 3 times
 		if(unknownHost.getTimesSent() < 3){
 			unknownHost.incrementTimesSent();
-			forwardARPPacket(arpRequestPacket, dstIP);
+			sendPacket(arpRequestPacket, outIface);
 		}
 		// If it has already been sent 3 times, don't reschedule the timer
 		else{
@@ -331,13 +286,36 @@ public class Router extends Device
 				//for(int i = 0; i < messages.size(); i++){
 				//msg = messages.remove();
 				ipPacket = (IPv4) msg.getPayload();
-				sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, msg, inIface, ipPacket);
+				sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, msg, this.getInIface(msg), ipPacket);
 				System.out.println("SEND ICMP MSG");
 			}
 			System.out.println("we sent all the messages in the queue!!! woohooo!");
 			//remove dstIP from map
 			map.remove(unknownHost);
 		}
+	}
+
+	private Iface getOutIface(Ethernet etherPacket) {
+		// Get IP header
+		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
+		int dstAddr = ipPacket.getDestinationAddress();
+
+		// Find matching route table entry 
+		RouteEntry bestMatch = this.routeTable.lookup(dstAddr);
+
+		return bestMatch.getInterface();
+	}
+	
+	private Iface getInIface(Ethernet etherPacket){
+
+		// Get IP header
+		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
+		int dstAddr = ipPacket.getSourceAddress();
+
+		// Find matching route table entry 
+		RouteEntry bestMatch = this.routeTable.lookup(dstAddr);
+
+		return bestMatch.getInterface();
 	}
 
 	private void handleIpPacket(Ethernet etherPacket, Iface inIface)
@@ -437,7 +415,7 @@ public class Router extends Device
 			//sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, etherPacket, inIface, ipPacket);
 			//
 			//Also need to do some sort of queueing per IP addr
-			handleArpCacheMiss(etherPacket, inIface, ipPacket);
+			handleArpCacheMiss(bestMatch, nextHop, etherPacket, inIface, ipPacket);
 			return; 
 		}
 		etherPacket.setDestinationMACAddress(arpEntry.getMac().toBytes());
@@ -552,4 +530,3 @@ public class Router extends Device
 }
 
 
-}
