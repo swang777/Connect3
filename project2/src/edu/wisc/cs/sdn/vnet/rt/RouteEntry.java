@@ -2,6 +2,7 @@ package edu.wisc.cs.sdn.vnet.rt;
 
 import net.floodlightcontroller.packet.IPv4;
 import edu.wisc.cs.sdn.vnet.Iface;
+import edu.wisc.cs.sdn.vnet.rt.Router.ExpireRouteEntryTask;
 
 /**
  * An entry in a route table.
@@ -22,6 +23,8 @@ public class RouteEntry
 	 * the destination or gateway */
 	private Iface iface;
 	
+	private ExpireRouteEntryTask rtask;
+	
 	/**
 	 * Create a new route table entry.
 	 * @param destinationAddress destination IP address
@@ -37,6 +40,16 @@ public class RouteEntry
 		this.gatewayAddress = gatewayAddress;
 		this.maskAddress = maskAddress;
 		this.iface = iface;
+	}
+	
+	public RouteEntry(int destinationAddress, int gatewayAddress, 
+			int maskAddress, Iface iface, ExpireRouteEntryTask rtask)
+	{
+		this.destinationAddress = destinationAddress;
+		this.gatewayAddress = gatewayAddress;
+		this.maskAddress = maskAddress;
+		this.iface = iface;
+		this.rtask = rtask;
 	}
 	
 	/**
@@ -69,6 +82,10 @@ public class RouteEntry
 
     public void setInterface(Iface iface)
     { this.iface = iface; }
+    
+    public void setSubnetAddress(int addr){
+    	this.maskAddress = addr;
+    }
 	
 	public String toString()
 	{
@@ -77,5 +94,11 @@ public class RouteEntry
 				IPv4.fromIPv4Address(this.gatewayAddress),
 				IPv4.fromIPv4Address(this.maskAddress),
 				this.iface.getName());
+	}
+	
+	public ExpireRouteEntryTask resetTimerTask(ExpireRouteEntryTask t){
+		ExpireRouteEntryTask toCancel = rtask;
+		rtask = t;
+		return toCancel;
 	}
 }

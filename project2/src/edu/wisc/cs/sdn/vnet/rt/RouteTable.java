@@ -10,8 +10,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import net.floodlightcontroller.packet.IPv4;
-
 import edu.wisc.cs.sdn.vnet.Iface;
+import edu.wisc.cs.sdn.vnet.rt.Router.ExpireRouteEntryTask;
 
 /**
  * Route table for a router.
@@ -168,6 +168,14 @@ public class RouteTable
         }
 	}
 	
+	public void insert(int dstIp, int gwIp, int maskIp, Iface iface, ExpireRouteEntryTask rtask)
+	{
+		RouteEntry entry = new RouteEntry(dstIp, gwIp, maskIp, iface, rtask);
+        synchronized(this.entries)
+        { 
+            this.entries.add(entry);
+        }
+	}
 	/**
 	 * Remove an entry from the route table.
 	 * @param dstIP destination IP of the entry to remove
