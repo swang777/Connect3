@@ -67,6 +67,11 @@ public class RouteEntry
     public void setGatewayAddress(int gatewayAddress)
     { this.gatewayAddress = gatewayAddress; }
 	
+    public ExpireRouteEntryTask getTimerTask(){
+    	
+    	return this.rtask;
+    }
+    
 	/**
 	 * @return subnet mask 
 	 */
@@ -96,9 +101,7 @@ public class RouteEntry
 				this.iface.getName());
 	}
 	
-	public ExpireRouteEntryTask resetTimerTask(ExpireRouteEntryTask t){
-		ExpireRouteEntryTask toCancel = rtask;
+	public void resetTimerTask(ExpireRouteEntryTask t){
 		rtask = t;
-		return toCancel;
 	}
 }

@@ -2,8 +2,8 @@ package edu.wisc.cs.sdn.vnet.rt;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Hashtable;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -47,10 +47,10 @@ public class Router extends Device
 	Timer timer = new Timer();
 
 	Map<Integer, UnknownQueue> map = new ConcurrentHashMap<Integer, UnknownQueue>();
-	Map<Integer ,RIPv2Entry> ripTable = new ConcurrentHashMap<Integer, RIPv2Entry>();
+	public Hashtable<Integer ,RIPv2Entry> ripTable = new Hashtable<Integer, RIPv2Entry>();
 	
 	/** Routing table for the router */
-	private RouteTable routeTable;
+	public RouteTable routeTable;
 
 	/** ARP cache for the router */
 	private ArpCache arpCache;
@@ -77,7 +77,7 @@ public class Router extends Device
 		initializeRipTable();
 		broadcastRIP(RIPv2.COMMAND_REQUEST);
 		RipBroadcastTask ripBroadcast = new RipBroadcastTask(this);
-		timer.schedule(ripBroadcast, BROADCAST_RIP_TABLE_ENTRIES);
+		timer.schedule(ripBroadcast, BROADCAST_RIP_TABLE_ENTRIES, BROADCAST_RIP_TABLE_ENTRIES);
 	}
 	
 	// adds all the reachable subnets of the routers interfaces to the route
@@ -100,22 +100,25 @@ public class Router extends Device
 			ripTable.put(dstIp, ripEntry);
 			
 			// Also add the entries to our routeTable
-			ExpireRouteEntryTask routeEntryExpiration = new ExpireRouteEntryTask(this);
-			routeTable.insert(dstIp, gateway, maskIp, iface, routeEntryExpiration);
-			
-			routeEntryExpiration.setRouteEtnry(routeTable.lookup(dstIp));
-			//schedule route entry to expire in 30 seconds if not updated
-			timer.schedule(routeEntryExpiration, ROUTE_ENTRY_EXPIRATION_TIME);
+			routeTable.insert((dstIp & maskIp), gateway, maskIp, iface);
+			System.out.println("Initialize route table with my interfaces");
 		}
 	}
 	// remove entry from rip table and route table
-	private void expireRouteEntry(RouteEntry toExpire){
-		ripTable.remove(toExpire.getDestinationAddress());
-		routeTable.remove(toExpire.getDestinationAddress(), toExpire.getMaskAddress());
+	public void expireRouteEntry(int dst, int mask){
+
+		//toExpire.getTimerTask().cancel();
+		//timer.purge();
+		ripTable.remove(dst);
+		routeTable.remove((dst & mask), mask);
+		System.out.println("remove from my route table. entry expired");
+		System.out.println(routeTable.toString());
 	}
 	
 	private void broadcastRIP(byte ripCommand){
 		Map<String, Iface> ifaces = this.interfaces;
+		
+		System.out.println(routeTable.toString());
 		
 		for(Entry<String, Iface> entry : ifaces.entrySet()){
 			MACAddress srcMAC = entry.getValue().getMacAddress();
@@ -180,7 +183,9 @@ public class Router extends Device
 				
 				if(newMetric < currentMetric){
 					ripTable.remove(entry.getAddress());
-					sendTable = updateRipEntry(entry, inIface);
+					if(newMetric < 16){
+						sendTable = updateRipEntry(entry, inIface);
+					}
 				}
 			}
 			else{
@@ -199,9 +204,14 @@ public class Router extends Device
 	
 	private boolean updateRipEntry(RIPv2Entry entry, Iface inIface){
 		
-		ExpireRouteEntryTask newTask = new ExpireRouteEntryTask(this);
+		ExpireRouteEntryTask newTask = null;
 		//increase hop count and update rip table
-		entry.setMetric(entry.getMetric()+1);
+		int metric = entry.getMetric()+1;
+		if(metric > 16){
+			metric = 16;
+		}
+		entry.setMetric(metric);
+		System.out.println("We are updating our rip table with info from otehr routers");
 		ripTable.put(entry.getAddress(), entry);
 		
 		RouteEntry rEntry = routeTable.lookup(entry.getAddress());
@@ -211,18 +221,21 @@ public class Router extends Device
 			rEntry.setInterface(inIface);
 			rEntry.setSubnetAddress(entry.getSubnetMask());
 			rEntry.setGatewayAddress(entry.getNextHopAddress());
-			
-			ExpireRouteEntryTask toCancel = rEntry.resetTimerTask(newTask);
-			toCancel.cancel();
-			timer.purge();
-			
+			ExpireRouteEntryTask atask = rEntry.getTimerTask();
+			if(atask != null){
+				atask.cancel();
+				timer.purge();
+				newTask = new ExpireRouteEntryTask(this, rEntry.getDestinationAddress(), rEntry.getMaskAddress());
+				rEntry.resetTimerTask(newTask);
+			}
 		}
 		else{
 			//add new entry
-			routeTable.insert(entry.getAddress(), entry.getNextHopAddress(), entry.getSubnetMask(), inIface, newTask);
+			newTask = new ExpireRouteEntryTask(this, entry.getAddress(), entry.getSubnetMask());
+			routeTable.insert((entry.getAddress() & entry.getSubnetMask()), inIface.getIpAddress(), inIface.getSubnetMask(), inIface, newTask);
 		}
-		newTask.setRouteEtnry(rEntry);
-		timer.schedule(newTask, ROUTE_ENTRY_EXPIRATION_TIME);
+		if(newTask != null)
+			timer.schedule(newTask, ROUTE_ENTRY_EXPIRATION_TIME);
 		return true;
 	}
 	
@@ -271,8 +284,8 @@ public class Router extends Device
 	 */
 	public void handlePacket(Ethernet etherPacket, Iface inIface)
 	{
-		System.out.println("*** -> Received packet: " +
-				etherPacket.toString().replace("\n", "\n\t"));
+		//System.out.println("*** -> Received packet: " +
+		//		etherPacket.toString().replace("\n", "\n\t"));
 
 		/********************************************************************/
 
@@ -299,6 +312,10 @@ public class Router extends Device
 		// Make sure it's an ARP Request
 		if (arpPacket.getOpCode() == ARP.OP_REQUEST){
 			System.out.println("We have an ARP Request");
+			
+			int dstIP = IPv4.toIPv4Address(arpPacket.getSenderProtocolAddress());
+			MACAddress dstMAC = MACAddress.valueOf(arpPacket.getSenderHardwareAddress());
+			arpCache.insert(dstMAC, dstIP);
 			// Only respond to ARP requests whose target IP equals IP of 
 			// interface on which the ARP request was received.
 			if(targetIp == inIface.getIpAddress()){
@@ -485,7 +502,7 @@ public class Router extends Device
 
 		// Get IP header
 		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
-		System.out.println("Handle IP packet");
+		//System.out.println("Handle IP packet");
 		
 		// Verify checksum
 		short origCksum = ipPacket.getChecksum();
@@ -698,18 +715,17 @@ public class Router extends Device
 	}
 	
 	class ExpireRouteEntryTask extends TimerTask {
-		private RouteEntry entry;
 		private Router router;
-		
-		public ExpireRouteEntryTask(Router r){
+		private int dstAddr, maskAddr;
+		public ExpireRouteEntryTask(Router r, int dst, int mask){
 			router = r;
+			dstAddr = dst;
+			maskAddr = mask;
 		}
-		public void setRouteEtnry(RouteEntry rEntry){
-			entry = rEntry;
-		}
+
 		@Override
 		public void run() {
-			router.expireRouteEntry(entry);
+			router.expireRouteEntry(dstAddr, maskAddr);
 		}
 	}
 	
