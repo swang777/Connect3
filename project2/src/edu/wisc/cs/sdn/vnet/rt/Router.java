@@ -1,67 +1,62 @@
 package edu.wisc.cs.sdn.vnet.rt;
 
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Hashtable;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Queue;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.concurrent.ConcurrentHashMap;
-
 import edu.wisc.cs.sdn.vnet.Device;
 import edu.wisc.cs.sdn.vnet.DumpFile;
 import edu.wisc.cs.sdn.vnet.Iface;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.nio.ByteBuffer;
+import java.util.LinkedList;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+
 import net.floodlightcontroller.packet.ARP;
-import net.floodlightcontroller.packet.Data;
 import net.floodlightcontroller.packet.Ethernet;
-import net.floodlightcontroller.packet.ICMP;
 import net.floodlightcontroller.packet.IPv4;
 import net.floodlightcontroller.packet.MACAddress;
 import net.floodlightcontroller.packet.RIPv2;
 import net.floodlightcontroller.packet.RIPv2Entry;
 import net.floodlightcontroller.packet.UDP;
+import net.floodlightcontroller.packet.ICMP;
+import net.floodlightcontroller.packet.Data;
 
 /**
  * @author Aaron Gember-Jacobson and Anubhavnidhi Abhashkumar
  */
-
-public class Router extends Device
-{	
-	private static final byte TYPE_TIME_EXCEEDED = 11;
-	private static final byte TYPE_DESTINATION_UNREACHABLE = 3;
-	private static final byte TYPE_ECHO_REPLY = 0;
-	private static final byte BROADCAST[] = {127, 127, 127, 127, 127, 127};
-	private static final byte CODE_TIME_EXCEEDED = 0;
-	private static final byte CODE_NET_UNREACHABLE = 0;
-	private static final byte CODE_HOST_UNREACHABLE = 1;
-	private static final byte CODE_PORT_UNREACHABLE = 3;
-	private static final byte CODE_ECHO_REPLY = 0;
-	private static final String RIP_MULTICAST_ADDR = "224.0.0.9";
-	private static final int ROUTE_ENTRY_EXPIRATION_TIME = 30 * 1000;
-	private static final int BROADCAST_RIP_TABLE_ENTRIES = 10 * 1000;
-			
-	Timer timer = new Timer();
-
-	Map<Integer, UnknownQueue> map = new ConcurrentHashMap<Integer, UnknownQueue>();
-	public Hashtable<Integer ,RIPv2Entry> ripTable = new Hashtable<Integer, RIPv2Entry>();
-	
+public class Router extends Device {
 	/** Routing table for the router */
-	public RouteTable routeTable;
+	private RouteTable routeTable;
 
 	/** ARP cache for the router */
 	private ArpCache arpCache;
 
+	public static final byte ICMP_TIMEOUT_CODE = 0;
+	public static final byte ICMP_TIMEOUT_TYPE = 11;
+	public static final byte ICMP_HOST_NOT_REACHABLE_TYPE = 3;
+	public static final byte ICMP_HOST_NOT_REACHABLE_CODE = 0;
+	public static final byte ICMP_PORT_NOT_REACHABLE_TYPE = 3;
+	public static final byte ICMP_PORT_NOT_REACHABLE_CODE = 3;
+	public static final byte ICMP_ECHO_REPLY_TYPE = 0;
+	public static final byte ICMP_ECHO_REPLY_CODE = 0;
+	private static final int ROUTE_ENTRY_EXPIRATION_TIME = 30000;
+	private static final int BROADCAST_RIP_TABLE_ENTRIES = 10000;
+	private static final byte BROADCAST[] = { 127, 127, 127, 127, 127, 127 };
+
+	Timer timer = new Timer();
+	public HashMap<Integer, RIPv2Entry> ripTable = new HashMap<Integer, RIPv2Entry>();
+	Map<Integer, UnknownQueue> Arp_map = new ConcurrentHashMap<Integer, UnknownQueue>();
+
 	/**
 	 * Creates a router for a specific host.
+	 * 
 	 * @param host hostname for the router
 	 */
-	public Router(String host, DumpFile logfile)
-	{
-		super(host,logfile);
+	public Router(String host, DumpFile logfile) {
+		super(host, logfile);
 		this.routeTable = new RouteTable();
 		this.arpCache = new ArpCache();
 	}
@@ -69,186 +64,158 @@ public class Router extends Device
 	/**
 	 * @return routing table for the router
 	 */
-	public RouteTable getRouteTable()
-	{ return this.routeTable; }
-	
-	public void runRipv2(){
+	public RouteTable getRouteTable() {
+		return this.routeTable;
+	}
+
+	public void loadRipv2() {
 		routeTable = new RouteTable();
 		initializeRipTable();
 		broadcastRIP(RIPv2.COMMAND_REQUEST);
 		RipBroadcastTask ripBroadcast = new RipBroadcastTask(this);
 		timer.schedule(ripBroadcast, BROADCAST_RIP_TABLE_ENTRIES, BROADCAST_RIP_TABLE_ENTRIES);
 	}
-	
+
 	// adds all the reachable subnets of the routers interfaces to the route
 	// table and to our rip table
-	private void initializeRipTable(){
-		int gateway = 0;
-		int metric = 1; //can reach at distance 1		
+	private void initializeRipTable() {
 		Map<String, Iface> ifaces = this.interfaces;
-		
-		//go over each entry and grab its info to construct ripEntry
-		//ALSO NEED TO ADD EACH ENTRY TO ROUTE TABLE
-		for(Entry<String, Iface> entry : ifaces.entrySet()){
-			Iface iface = entry.getValue();
+		for (String key : ifaces.keySet()) {
+			Iface iface = ifaces.get(key);
 			int dstIp = iface.getIpAddress();
 			int maskIp = iface.getSubnetMask();
-			//int Subnet = dstIp & maskIp;
-			
-			RIPv2Entry ripEntry = new RIPv2Entry();
-			ripEntry = new RIPv2Entry(dstIp, maskIp, metric);
-			ripTable.put(dstIp, ripEntry);
-			
-			// Also add the entries to our routeTable
-			routeTable.insert((dstIp & maskIp), gateway, maskIp, iface);
-			System.out.println("Initialize route table with my interfaces");
-		}
-	}
-	// remove entry from rip table and route table
-	public void expireRouteEntry(int dst, int mask){
 
-		//toExpire.getTimerTask().cancel();
-		//timer.purge();
-		ripTable.remove(dst);
-		routeTable.remove((dst & mask), mask);
-		System.out.println("remove from my route table. entry expired");
-		System.out.println(routeTable.toString());
-	}
-	
-	private void broadcastRIP(byte ripCommand){
-		Map<String, Iface> ifaces = this.interfaces;
-		
-		System.out.println(routeTable.toString());
-		
-		for(Entry<String, Iface> entry : ifaces.entrySet()){
-			MACAddress srcMAC = entry.getValue().getMacAddress();
-			int srcIP = entry.getValue().getIpAddress();
-			Ethernet ripPacket = setupRipPacket(ripCommand, srcIP, srcMAC);
-			sendPacket(ripPacket, entry.getValue());
+			RIPv2Entry ripEntry = new RIPv2Entry(dstIp, maskIp, 1);
+			ripTable.put(dstIp, ripEntry);
+			routeTable.insert((dstIp & maskIp), 0, maskIp, iface);
+			System.out.println("Initialize");
 		}
 	}
-	
-	private Ethernet setupRipPacket(byte ripCommand, int srcIP, MACAddress srcMAC){
+
+	private void broadcastRIP(byte ripCommand) {
+		Map<String, Iface> ifaces = this.interfaces;
+
+		for (String key : ifaces.keySet()) {
+			MACAddress srcMAC = ifaces.get(key).getMacAddress();
+			int srcIP = ifaces.get(key).getIpAddress();
+			Ethernet packet = setupRipPacket(ripCommand, srcIP, srcMAC);
+			sendPacket(packet, ifaces.get(key));
+		}
+	}
+
+	private Ethernet setupRipPacket(byte ripCommand, int srcIP, MACAddress srcMAC) {
 		Ethernet ether = new Ethernet();
 		IPv4 ip = new IPv4();
-		UDP udp = new UDP();
 		RIPv2 rip = new RIPv2();
+		UDP udp = new UDP();
 
-		//link packets together
 		ether.setPayload(ip);
 		ip.setPayload(udp);
 		udp.setPayload(rip);
 
-		//ethernet layer
 		ether.setEtherType(Ethernet.TYPE_IPv4);
 		ether.setDestinationMACAddress(BROADCAST);
 		ether.setSourceMACAddress(srcMAC.toBytes());
 
-		//ip layer
+		if (ip == null) {
+			System.out.println("no ip");
+		}
 		ip.setSourceAddress(srcIP);
-		ip.setDestinationAddress(RIP_MULTICAST_ADDR);
+		ip.setDestinationAddress("224.0.0.9");
 		ip.setProtocol(IPv4.PROTOCOL_UDP);
 
-		//udp layer
 		udp.setSourcePort(UDP.RIP_PORT);
 		udp.setDestinationPort(UDP.RIP_PORT);
 
-		//set up rip
 		rip.setCommand(ripCommand);
-		List<RIPv2Entry> entries = new ArrayList<RIPv2Entry>(ripTable.values());
-		rip.setEntries(entries);
-		
-		//reset checksums
+
+		if (ripCommand == RIPv2.COMMAND_RESPONSE) {
+			List<RIPv2Entry> entries = new ArrayList<RIPv2Entry>(ripTable.values());
+			rip.setEntries(entries);
+		} else {
+			rip.setEntries(new ArrayList<RIPv2Entry>());
+		}
+
 		udp.resetChecksum();
 		ip.resetChecksum();
 		ether.resetChecksum();
-		
+
 		return ether;
 	}
-	
+
 	private void handleRipPacket(RIPv2 ripPacket, Iface inIface) {
-		boolean sendTable = false;
-		boolean sendResponse = true;
-		
-		if(ripPacket.getCommand() == RIPv2.COMMAND_REQUEST){
-			sendResponse = true;
+
+		if (ripPacket.getCommand() == RIPv2.COMMAND_REQUEST) {
+			Ethernet ripPacketResponse = setupRipPacket(RIPv2.COMMAND_RESPONSE, inIface.getIpAddress(),
+					inIface.getMacAddress());
+			sendPacket(ripPacketResponse, inIface);
+			return;
 		}
-		
+
+		boolean updated = false;
 		List<RIPv2Entry> newRipEntries = ripPacket.getEntries();
-		for(RIPv2Entry entry : newRipEntries){
-			
-			if(ripTable.containsKey(entry.getAddress())){
+		for (RIPv2Entry entry : newRipEntries) {
+
+			if (ripTable.containsKey(entry.getAddress())) {
 				int currentMetric = ripTable.get(entry.getAddress()).getMetric();
 				int newMetric = entry.getMetric() + 1;
-				
-				if(newMetric < currentMetric){
+
+				if (newMetric < currentMetric) {
 					ripTable.remove(entry.getAddress());
-					if(newMetric < 16){
-						sendTable = updateRipEntry(entry, inIface);
+					if (newMetric < 16) {
+						updated = updateRipEntry(entry, inIface);
 					}
 				}
-			}
-			else{
-				sendTable = updateRipEntry(entry, inIface);
+			} else {
+				updated = updateRipEntry(entry, inIface);
 			}
 		}
-		
-		if(sendTable){
+
+		if (updated) {
 			broadcastRIP(RIPv2.COMMAND_RESPONSE);
 		}
-		else if(sendResponse){
-			Ethernet ripPacketResponse = setupRipPacket(RIPv2.COMMAND_RESPONSE, inIface.getIpAddress(), inIface.getMacAddress());
-			sendPacket(ripPacketResponse, inIface);
-		}
 	}
-	
-	private boolean updateRipEntry(RIPv2Entry entry, Iface inIface){
-		
-		ExpireRouteEntryTask newTask = null;
-		//increase hop count and update rip table
-		int metric = entry.getMetric()+1;
-		if(metric > 16){
+
+	private boolean updateRipEntry(RIPv2Entry entry, Iface inIface) {
+
+		int metric = entry.getMetric() + 1;
+		if (metric > 16) {
 			metric = 16;
 		}
 		entry.setMetric(metric);
-		System.out.println("We are updating our rip table with info from otehr routers");
 		ripTable.put(entry.getAddress(), entry);
-		
+
 		RouteEntry rEntry = routeTable.lookup(entry.getAddress());
-		//update route table
-		if(rEntry != null){
-			//in table already
+		// update
+		if (rEntry != null) {
 			rEntry.setInterface(inIface);
 			rEntry.setSubnetAddress(entry.getSubnetMask());
 			rEntry.setGatewayAddress(entry.getNextHopAddress());
-			ExpireRouteEntryTask atask = rEntry.getTimerTask();
-			if(atask != null){
-				atask.cancel();
+			ExpireRouteEntryTask task = rEntry.getTimerTask();
+			if (task != null) {
+				task.cancel();
 				timer.purge();
-				newTask = new ExpireRouteEntryTask(this, rEntry.getDestinationAddress(), rEntry.getMaskAddress());
-				rEntry.resetTimerTask(newTask);
+				task = new ExpireRouteEntryTask(rEntry.getDestinationAddress(), rEntry.getMaskAddress());
+				rEntry.resetTimerTask(task);
+				timer.schedule(task, ROUTE_ENTRY_EXPIRATION_TIME);
 			}
-		}
-		else{
-			//add new entry
-			newTask = new ExpireRouteEntryTask(this, entry.getAddress(), entry.getSubnetMask());
-			routeTable.insert((entry.getAddress() & entry.getSubnetMask()), inIface.getIpAddress(), inIface.getSubnetMask(), inIface, newTask);
-		}
-		if(newTask != null)
+		} else {
+			ExpireRouteEntryTask newTask = new ExpireRouteEntryTask(entry.getAddress(), entry.getSubnetMask());
+			routeTable.insert((entry.getAddress() & entry.getSubnetMask()), inIface.getIpAddress(),
+					inIface.getSubnetMask(), inIface, newTask);
 			timer.schedule(newTask, ROUTE_ENTRY_EXPIRATION_TIME);
+		}
 		return true;
 	}
-	
+
 	/**
 	 * Load a new routing table from a file.
+	 * 
 	 * @param routeTableFile the name of the file containing the routing table
 	 */
-	public void loadRouteTable(String routeTableFile)
-	{
-		if (!routeTable.load(routeTableFile, this))
-		{
-			System.err.println("Error setting up routing table from file "
-					+ routeTableFile);
+	public void loadRouteTable(String routeTableFile) {
+		if (!routeTable.load(routeTableFile, this)) {
+			System.err.println("Error setting up routing table from file " + routeTableFile);
 			System.exit(1);
 		}
 
@@ -260,14 +227,12 @@ public class Router extends Device
 
 	/**
 	 * Load a new ARP cache from a file.
+	 * 
 	 * @param arpCacheFile the name of the file containing the ARP cache
 	 */
-	public void loadArpCache(String arpCacheFile)
-	{
-		if (!arpCache.load(arpCacheFile))
-		{
-			System.err.println("Error setting up ARP cache from file "
-					+ arpCacheFile);
+	public void loadArpCache(String arpCacheFile) {
+		if (!arpCache.load(arpCacheFile)) {
+			System.err.println("Error setting up ARP cache from file " + arpCacheFile);
 			System.exit(1);
 		}
 
@@ -277,256 +242,193 @@ public class Router extends Device
 		System.out.println("----------------------------------");
 	}
 
+	public void sendICMP(Ethernet etherPacket, Iface inIface, byte type, byte code) {
+		Ethernet ether = new Ethernet();
+		IPv4 ip = new IPv4();
+		ICMP icmp = new ICMP();
+		Data data = new Data();
+		IPv4 ipPacket = (IPv4) etherPacket.getPayload();
+		// Nest packets inside the Ethernet packet
+		ether.setPayload(ip);
+		ip.setPayload(icmp);
+		icmp.setPayload(data);
+		// Set Ethernet header
+		ether.setEtherType(Ethernet.TYPE_IPv4); // EtherType
+		ether.setSourceMACAddress(inIface.getMacAddress().toBytes()); // Source MAC
+		int srcIp = ipPacket.getSourceAddress(); // Destination MAC - find and set
+		RouteEntry routeEntry = this.routeTable.lookup(srcIp);
+		int nextHop = routeEntry.getGatewayAddress();
+		if (nextHop == 0)
+			nextHop = srcIp;
+		ArpEntry arpEntry = this.arpCache.lookup(nextHop);
+		if (arpEntry == null) {
+			ether.setDestinationMACAddress(etherPacket.getSourceMAC().toBytes());
+		} else {
+			ether.setDestinationMACAddress(arpEntry.getMac().toBytes());
+		}
+		// Set IP header
+		ip.setTtl((byte) 64); // TTL — set to 64
+		ip.setProtocol(IPv4.PROTOCOL_ICMP); // Protocol
+		if (code == ICMP_ECHO_REPLY_CODE && type == ICMP_ECHO_REPLY_TYPE) { // Source IP
+			ip.setSourceAddress(ipPacket.getDestinationAddress());
+		} else {
+			ip.setSourceAddress(inIface.getIpAddress());
+		}
+		ip.setDestinationAddress(srcIp); // Destination IP
+		// Set ICMP header
+		icmp.setIcmpType(type); // Type
+		icmp.setIcmpCode(code); // Code
+		// Set Data
+		if (code == ICMP_ECHO_REPLY_CODE && type == ICMP_ECHO_REPLY_TYPE) {
+			ICMP icmpPacket = (ICMP) ipPacket.getPayload();
+			data.setData(icmpPacket.getPayload().serialize());
+		} else {
+			int ipPacketHeaderLength = 4 * (int) ipPacket.getHeaderLength(); // header length in byte
+			byte[] icmpData = new byte[4 + ipPacketHeaderLength + 8];
+			ByteBuffer bb = ByteBuffer.wrap(icmpData);
+			// 4 bytes of padding, all 0
+			bb.putInt(0);
+			// original IP header and 8 bytes following it, starting from the start of
+			// packet byte arr
+			bb.put(ipPacket.serialize(), 0, ipPacketHeaderLength + 8);
+			data.setData(icmpData);
+		}
+		// Reset checksum from inside out
+		icmp.resetChecksum();
+		ip.resetChecksum();
+		ether.resetChecksum();
+		// Send packet
+		sendPacket(ether, inIface);
+	}
+
+	// public void handlePacket(Ethernet etherPacket, Iface inIface)
+	// {
+	// 	System.out.println("*** -> Received packet: " +
+    //             etherPacket.toString().replace("\n", "\n\t"));
+		
+	// 	/********************************************************************/
+	// 	/* TODO: Handle packets                                             */
+		
+	// 	switch(etherPacket.getEtherType())
+	// 	{
+	// 	case Ethernet.TYPE_IPv4:
+	// 		this.handleIpPacket(etherPacket, inIface);
+	// 		break;
+
+	// 	case Ethernet.TYPE_ARP:
+	// 		this.handle_Arp_Packet(etherPacket, inIface);
+	// 		break;
+	// 	}
+
+		
+	// 	/********************************************************************/
+	// }
+
 	/**
 	 * Handle an Ethernet packet received on a specific interface.
+	 * 
 	 * @param etherPacket the Ethernet packet that was received
-	 * @param inIface the interface on which the packet was received
+	 * @param inIface     the interface on which the packet was received
 	 */
-	public void handlePacket(Ethernet etherPacket, Iface inIface)
-	{
-		//System.out.println("*** -> Received packet: " +
-		//		etherPacket.toString().replace("\n", "\n\t"));
+	public void handlePacket(Ethernet etherPacket, Iface inIface) {
+		System.out.println("*** -> Received packet: " + etherPacket.toString().replace("\n", "\n\t"));
 
-		/********************************************************************/
+		// drop packets that are not IPv4
+		if (etherPacket.getEtherType() == Ethernet.TYPE_ARP ){
+			handle_Arp_Packet(etherPacket, inIface);
+			return;
+		}	
 
-		switch(etherPacket.getEtherType())
-		{
-		case Ethernet.TYPE_IPv4:
-			this.handleIpPacket(etherPacket, inIface);
-			break;
+		System.out.println("retain packet - ipv4");
+		//verify checksum
+		IPv4 packet = (IPv4) etherPacket.getPayload();
+		short gtChecksum = packet.getChecksum();
+		packet.resetChecksum(); // trigger checksum re-calculation in serialize()
+		ByteBuffer packetByteBuffer = ByteBuffer.wrap(packet.serialize());
+		short predChecksum = packetByteBuffer.getShort(10);
+		if (gtChecksum != predChecksum)
+			return;
 
-		case Ethernet.TYPE_ARP:
-			this.handleArpPacket(etherPacket, inIface);
-			break;
+		System.out.println("checksum correct - retain packet");
+		// decrease and verify ttl
+		int prevTtl = packet.getTtl(); // implicit conversion from byte to int
+		int currTtl = prevTtl - 1;
+		if (currTtl == 0) {
+			sendICMP(etherPacket, inIface, ICMP_TIMEOUT_TYPE, ICMP_TIMEOUT_CODE);
+			return;
 		}
-		// Ignore all other packet types, for now
+		packet.setTtl((byte) currTtl);
 
-		/********************************************************************/
-	}
+		System.out.println("ttl correct - retain packet");
+		// update checksum (necessary as we updated ttl)
+		packet.resetChecksum();
 
-	private void handleArpPacket(Ethernet etherPacket, Iface inIface) {
-
-		ARP arpPacket = (ARP)etherPacket.getPayload();
-		int targetIp = ByteBuffer.wrap(arpPacket.getTargetProtocolAddress()).getInt();
-
-		// Make sure it's an ARP Request
-		if (arpPacket.getOpCode() == ARP.OP_REQUEST){
-			System.out.println("We have an ARP Request");
-			
-			int dstIP = IPv4.toIPv4Address(arpPacket.getSenderProtocolAddress());
-			MACAddress dstMAC = MACAddress.valueOf(arpPacket.getSenderHardwareAddress());
-			arpCache.insert(dstMAC, dstIP);
-			// Only respond to ARP requests whose target IP equals IP of 
-			// interface on which the ARP request was received.
-			if(targetIp == inIface.getIpAddress()){
-
-				Ethernet ether = new Ethernet();
-				ARP arp = new ARP();
-				//link the headers together
-				ether.setPayload(arp);
-
-				//Ethernet Header
-				ether.setEtherType(Ethernet.TYPE_ARP);
-				ether.setSourceMACAddress(inIface.getMacAddress().toBytes());
-				ether.setDestinationMACAddress(etherPacket.getSourceMACAddress());
-
-				//ARP Header
-				arp.setHardwareType(ARP.HW_TYPE_ETHERNET);
-				arp.setProtocolType(ARP.PROTO_TYPE_IP);
-				arp.setHardwareAddressLength((byte)Ethernet.DATALAYER_ADDRESS_LENGTH);
-				arp.setProtocolAddressLength((byte) 4);
-				arp.setOpCode(ARP.OP_REPLY);
-
-				//sender
-				arp.setSenderHardwareAddress(inIface.getMacAddress().toBytes());
-				arp.setSenderProtocolAddress(inIface.getIpAddress());
-
-				//target
-				arp.setTargetHardwareAddress(arpPacket.getSenderHardwareAddress());
-				arp.setTargetProtocolAddress(arpPacket.getSenderProtocolAddress());
-
-				ether.resetChecksum();
-				sendPacket(ether, inIface);
-			}
+		//handle rip packet
+		if((packet.getProtocol() == IPv4.PROTOCOL_UDP) && (packet.getDestinationAddress() == IPv4.toIPv4Address("224.0.0.9"))){
+			UDP udpPacket = (UDP) packet.getPayload();
+			if(udpPacket.getSourcePort() == UDP.RIP_PORT){
+				RIPv2 ripPacket = (RIPv2) udpPacket.getPayload();
+				handleRipPacket(ripPacket, inIface);
+				return;
+			}	
 		}
-		else if( arpPacket.getOpCode() == ARP.OP_REPLY){
-			System.out.println("ARP Reply");
 
-			int dstIP = IPv4.toIPv4Address(arpPacket.getSenderProtocolAddress());
-			MACAddress dstMAC = MACAddress.valueOf(arpPacket.getSenderHardwareAddress());
+		byte[] packetData = packet.serialize();
+		packet.deserialize(packetData, 0, packetData.length);
 
-			// insert arpCache entry for the corresponding ARP reply
-			arpCache.insert(dstMAC, dstIP);
-
-			//dequeue the packets and enter the destination MAC
-			UnknownQueue foundHost = map.get(dstIP);
-			if(foundHost != null){
-				//cancel any pending arp timer tasks since we got the information we needed
-				foundHost.getArpTask().cancel();
-				//remove the scheduled tasks from the timer
-				timer.purge();
-				//send all of the stored messages that are destined for the newly found host
-				Queue<Ethernet> messages = foundHost.getQueue();
-				for(Ethernet msg : messages){
-					System.out.println("We found the host! Send some packets!");
-					msg.setDestinationMACAddress(dstMAC.toBytes());
-					sendPacket(msg, this.getOutIface(msg));
+		// if the packet is destined for one of router's interfaces, drop the packet
+		int destIp = packet.getDestinationAddress();
+		for (Iface iface : this.interfaces.values()) {
+			int ifaceIp = iface.getIpAddress();
+			if (destIp == ifaceIp) {
+				byte protocol = packet.getProtocol();
+				if (protocol == IPv4.PROTOCOL_UDP || protocol == IPv4.PROTOCOL_TCP) {
+					sendICMP(etherPacket, inIface, ICMP_PORT_NOT_REACHABLE_TYPE, ICMP_PORT_NOT_REACHABLE_CODE);
+				} else if (protocol == IPv4.PROTOCOL_ICMP) {
+					ICMP icmp = (ICMP) packet.getPayload();
+					if (icmp.getIcmpType() == ICMP.TYPE_ECHO_REQUEST) {
+						sendICMP(etherPacket, inIface, ICMP_ECHO_REPLY_TYPE, ICMP_ECHO_REPLY_CODE);
+						System.out.println("ICMP response sent");
+					}
 				}
-				map.remove(dstIP);	
+				System.out.println("packet is destined for router's interface - drop");
+				return;
 			}
 		}
+		System.out.println("forward packet");
+		// else, forward the packet
+		etherPacket.setPayload(packet);
+		forward(etherPacket, inIface);
 	}
-
-	private void handleArpCacheMiss(RouteEntry bestMatch, int nextHop, Ethernet etherPacket, Iface inIface, IPv4 ipkt) {
-
-		// If our map already has the destination address in it add message to queue
-		if(map.containsKey(ipkt.getDestinationAddress())){
-			// We need to add the message to our queue
-			System.out.println("Adding new message to existing queue");
-			UnknownQueue unknownHost = map.get(ipkt.getDestinationAddress());
-			unknownHost.getQueue().add(etherPacket);
-		}
-		//generate ARP request and broadcast it on all non-incoming interfaces
-		else{
-			int timeBeforeResend = 1000; // 1 second
-			Ethernet arpRequest = generateArpRequestPacket(nextHop, inIface);
-
-			/*Construct new object*/
-			ARPTask sendARPTask = new ARPTask(arpRequest, bestMatch.getInterface() , ipkt.getDestinationAddress());
-			UnknownQueue unknownHostInfo = new UnknownQueue(etherPacket, sendARPTask);
-
-			//get destination IP and add the corresponding UnknownQueue to the map
-			map.put(ipkt.getDestinationAddress(), unknownHostInfo);
-
-			//Schedule the task to go off in 1 second
-			timer.schedule(sendARPTask, timeBeforeResend, timeBeforeResend);
-
-			sendPacket(arpRequest, bestMatch.getInterface());
-		}
-	}
-
-	private Ethernet generateArpRequestPacket(int nextHop, Iface inIface) {
-		Ethernet ether = new Ethernet();
-		ARP arp = new ARP();
-
-		//link the headers together
-		ether.setPayload(arp);
-
-		//Ethernet Header
-		ether.setEtherType(Ethernet.TYPE_ARP);
-		ether.setSourceMACAddress(inIface.getMacAddress().toBytes());
-		//ether.setSourceMACAddress(bestMatch.getInterface().getMacAddress().toBytes());
-		ether.setDestinationMACAddress(BROADCAST);
-
-		//ARP Header
-		arp.setHardwareType(ARP.HW_TYPE_ETHERNET);
-		arp.setProtocolType(ARP.PROTO_TYPE_IP);
-		arp.setHardwareAddressLength((byte)Ethernet.DATALAYER_ADDRESS_LENGTH);
-		arp.setProtocolAddressLength((byte) 4);
-		arp.setOpCode(ARP.OP_REQUEST);
-
-		//sender
-		arp.setSenderHardwareAddress(inIface.getMacAddress().toBytes());
-		arp.setSenderProtocolAddress(inIface.getIpAddress());
-
-		//target
-		byte unknown[] = {0, 0, 0, 0, 0, 0};
-		arp.setTargetHardwareAddress(unknown);
-		arp.setTargetProtocolAddress(nextHop);
-
-		ether.resetChecksum();
-
-		return ether;
-	}
-	
-	private void checkIfContinueTryingToSendArpPacket(Ethernet arpRequestPacket, Iface outIface, int dstIP){
-		UnknownQueue unknownHost = map.get(dstIP);
-		// Send the message up to 3 times
-		if(unknownHost.getTimesSent() < 3){
-			unknownHost.incrementTimesSent();
-			sendPacket(arpRequestPacket, outIface);
-		}
-		// If it has already been sent 3 times, don't reschedule the timer
-		else{
-			IPv4 ipPacket;
-			//cancel timertask
-			unknownHost.getArpTask().cancel();
-			//purge timer
-			timer.purge();
-			//flush queue //send dst host unreachable
-			Queue<Ethernet> messages = unknownHost.getQueue();
-			System.out.println("size of queue" + messages.size());
-			//Ethernet msg;
-			for(Ethernet msg : messages){
-				//for(int i = 0; i < messages.size(); i++){
-				//msg = messages.remove();
-				ipPacket = (IPv4) msg.getPayload();
-				sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, msg, this.getInIface(msg), ipPacket);
-				System.out.println("SEND ICMP MSG");
-			}
-			System.out.println("we sent all the messages in the queue!!! woohooo!");
-			
-			//remove dstIP from map
-			map.remove(unknownHost);
-		}
-	}
-
-	private Iface getOutIface(Ethernet etherPacket) {
-		// Get IP header
-		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
-		int dstAddr = ipPacket.getDestinationAddress();
-
-		// Find matching route table entry 
-		RouteEntry bestMatch = this.routeTable.lookup(dstAddr);
-
-		return bestMatch.getInterface();
-	}
-	
-	private Iface getInIface(Ethernet etherPacket){
-
-		// Get IP header
-		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
-		int dstAddr = ipPacket.getSourceAddress();
-
-		// Find matching route table entry 
-		RouteEntry bestMatch = this.routeTable.lookup(dstAddr);
-
-		return bestMatch.getInterface();
-	}
-
 	private void handleIpPacket(Ethernet etherPacket, Iface inIface)
 	{
 		// Make sure it's an IP packet
 		if (etherPacket.getEtherType() != Ethernet.TYPE_IPv4)
 		{ return; }
-
+		
 		// Get IP header
 		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
-		//System.out.println("Handle IP packet");
-		
-		// Verify checksum
-		short origCksum = ipPacket.getChecksum();
-		ipPacket.resetChecksum();
-		byte[] serialized = ipPacket.serialize();
-		ipPacket.deserialize(serialized, 0, serialized.length);
-		short calcCksum = ipPacket.getChecksum();
-		if (origCksum != calcCksum)
-		{ return; }
+        System.out.println("Handle IP packet");
 
-		// Check TTL
-		ipPacket.setTtl((byte)(ipPacket.getTtl()-1));
-		if (0 == ipPacket.getTtl())
-		{ 
-			sendICMPmessage(TYPE_TIME_EXCEEDED, CODE_TIME_EXCEEDED, etherPacket, inIface, ipPacket);
-			return; 
-		}
+        // Verify checksum
+        short origCksum = ipPacket.getChecksum();
+        ipPacket.resetChecksum();
+        byte[] serialized = ipPacket.serialize();
+        ipPacket.deserialize(serialized, 0, serialized.length);
+        short calcCksum = ipPacket.getChecksum();
+        if (origCksum != calcCksum)
+        { return; }
+        
+        // Check TTL
+        ipPacket.setTtl((byte)(ipPacket.getTtl()-1));
+        if (0 == ipPacket.getTtl())
+        { return; }
+        
+        // Reset checksum now that TTL is decremented
+        ipPacket.resetChecksum();
 
-		// Reset checksum now that TTL is decremented
-		ipPacket.resetChecksum();
-		
 		//handle rip packet
-		if((ipPacket.getProtocol() == IPv4.PROTOCOL_UDP) && 
-		   (ipPacket.getDestinationAddress() == IPv4.toIPv4Address(RIP_MULTICAST_ADDR))){
+		if((ipPacket.getProtocol() == IPv4.PROTOCOL_UDP) && (ipPacket.getDestinationAddress() == IPv4.toIPv4Address("224.0.0.9"))){
 			UDP udpPacket = (UDP) ipPacket.getPayload();
 			if(udpPacket.getSourcePort() == UDP.RIP_PORT){
 				RIPv2 ripPacket = (RIPv2) udpPacket.getPayload();
@@ -534,167 +436,233 @@ public class Router extends Device
 				return;
 			}	
 		}
+        
+        // Check if packet is destined for one of router's interfaces
+        for (Iface iface : this.interfaces.values())
+        {
+        	if (ipPacket.getDestinationAddress() == iface.getIpAddress())
+        	{ return; }
+        }
 		
-		// Check if packet is destined for one of router's interfaces
-		for (Iface iface : this.interfaces.values())
-		{
-			if (ipPacket.getDestinationAddress() == iface.getIpAddress())
-			{ 
-				if(ipPacket.getProtocol() == IPv4.PROTOCOL_TCP || 
-						ipPacket.getProtocol() == IPv4.PROTOCOL_UDP){
-					sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_PORT_UNREACHABLE, etherPacket, inIface, ipPacket);
-
-				}
-				else if(ipPacket.getProtocol() == IPv4.PROTOCOL_ICMP){
-					ICMP icmpPacket = (ICMP)ipPacket.getPayload();
-					if(icmpPacket.getIcmpCode() == ICMP.TYPE_ECHO_REQUEST){
-						System.out.println("ever have an echo request?");
-						sendICMPmessage(TYPE_ECHO_REPLY, CODE_ECHO_REPLY, etherPacket, inIface, ipPacket);
-					}
-				}
-				return;
-			}
-		}
-
-		// Do route lookup and forward
-		this.forwardIpPacket(etherPacket, inIface);
+        // Do route lookup and forward
+        this.forwardIpPacket(etherPacket, inIface);
 	}
 
-	private void forwardIpPacket(Ethernet etherPacket, Iface inIface)
-	{
-		// Make sure it's an IP packet
-		if (etherPacket.getEtherType() != Ethernet.TYPE_IPv4)
-		{ return; }
-		System.out.println("Forward IP packet");
+	private void forward(Ethernet etherPacket, Iface inIface) {
+		// find matching route table entry
+		IPv4 ipPacket = (IPv4) etherPacket.getPayload();
+		int dst = ipPacket.getDestinationAddress();
+		RouteEntry match = this.routeTable.lookup(dst);
 
-		// Get IP header
-		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
-		int dstAddr = ipPacket.getDestinationAddress();
-
-		// Find matching route table entry 
-		RouteEntry bestMatch = this.routeTable.lookup(dstAddr);
-
-		// If no entry matched, do nothing
-		if (null == bestMatch)
-		{ 
-			sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_NET_UNREACHABLE, etherPacket, inIface, ipPacket);
-			return; 
+		// if no entry matched, drop
+		if (match == null) {
+			sendICMP(etherPacket, inIface, ICMP_HOST_NOT_REACHABLE_TYPE, ICMP_HOST_NOT_REACHABLE_CODE);
+			System.out.println("no match from routeTable - drop");
+			return;
 		}
 
-		// Make sure we don't sent a packet back out the interface it came in
-		Iface outIface = bestMatch.getInterface();
-		if (outIface == inIface)
-		{ return; }
+		// out should not be the same as the source
+		Iface outIface = match.getInterface();
+		if (outIface == inIface) {
+			System.out.println("out is the same as source - drop");
+			return;
+		}
 
-		// Set source MAC address in Ethernet header
-		etherPacket.setSourceMACAddress(outIface.getMacAddress().toBytes());
+		// determine next-hop IP address
+		// first check gateway
+		int nextHop = match.getGatewayAddress();
+		if (nextHop == 0) {
+			nextHop = dst;
+		}
 
-		// If no gateway, then nextHop is IP destination
-		int nextHop = bestMatch.getGatewayAddress();
-		if (0 == nextHop)
-		{ nextHop = dstAddr; }
-
-		// Set destination MAC address in Ethernet header
 		ArpEntry arpEntry = this.arpCache.lookup(nextHop);
-		if (null == arpEntry)
-		{ 
-			// This is temporarily commented out so that we can send an arp request
-			//sendICMPmessage(TYPE_DESTINATION_UNREACHABLE, CODE_HOST_UNREACHABLE, etherPacket, inIface, ipPacket);
-			//
-			//Also need to do some sort of queueing per IP addr
-			handleArpCacheMiss(bestMatch, nextHop, etherPacket, inIface, ipPacket);
-			return; 
+		if (arpEntry == null) {
+			// if no entry is found, generate a destination host unreachable ICMP message
+			// and drop the packet
+			sendICMP(etherPacket, inIface, ICMP_HOST_NOT_REACHABLE_TYPE, ICMP_HOST_NOT_REACHABLE_CODE);
+			// enqueue the packet and generate an ARP request if no matching entry is found
+			// in the ARP cache
+			handleNoEntryMatch(etherPacket, inIface, ipPacket, match, nextHop);
+			return;
 		}
-		etherPacket.setDestinationMACAddress(arpEntry.getMac().toBytes());
 
+		// update Ethernet header & send packet
+		System.out.println(outIface.getMacAddress() + "->" + arpEntry.getMac());
+		etherPacket.setSourceMACAddress(outIface.getMacAddress().toBytes());
+		etherPacket.setDestinationMACAddress(arpEntry.getMac().toBytes());
+		System.out.println("send packet");
 		this.sendPacket(etherPacket, outIface);
 	}
 
-	private void sendICMPmessage(byte type, byte code, Ethernet etherPacket, Iface inIface, IPv4 ipPacket){
-		//send ICMP Time Exceeded message
-		Ethernet ether = new Ethernet();
-		IPv4 ip = new IPv4();
-		ICMP icmp = new ICMP();
-		Data data = new Data();
-
-		//Link the headers together
-		ether.setPayload(ip);
-		ip.setPayload(icmp);
-		icmp.setPayload(data);
-
-		////Find destination MAC
+	private void forwardIpPacket(Ethernet etherPacket, Iface inIface)
+    {
+        // Make sure it's an IP packet
+		if (etherPacket.getEtherType() != Ethernet.TYPE_IPv4)
+		{ return; }
+        System.out.println("Forward IP packet");
+		
 		// Get IP header
-		ipPacket.resetChecksum();
-		int srcAddr = ipPacket.getSourceAddress();
+		IPv4 ipPacket = (IPv4)etherPacket.getPayload();
+        int dstAddr = ipPacket.getDestinationAddress();
 
-		// Find matching route table entry 
-		RouteEntry bestMatch = this.routeTable.lookup(srcAddr);;
+        // Find matching route table entry 
+        RouteEntry bestMatch = this.routeTable.lookup(dstAddr);
 
-		// If no gateway, then nextHop is IP destination
-		int nextHop = bestMatch.getGatewayAddress();
-		if (0 == nextHop)
-		{ nextHop = srcAddr; }
+        // If no entry matched, do nothing
+        if (null == bestMatch)
+        { return; }
 
-		// Set destination MAC address in Ethernet header
-		ArpEntry arpEntry = this.arpCache.lookup(nextHop);
+        // Make sure we don't sent a packet back out the interface it came in
+        Iface outIface = bestMatch.getInterface();
+        if (outIface == inIface)
+        { return; }
 
-		//Update Ethernet header
-		ether.setEtherType(Ethernet.TYPE_IPv4);
-		ether.setSourceMACAddress(inIface.getMacAddress().toBytes());
+        // Set source MAC address in Ethernet header
+        etherPacket.setSourceMACAddress(outIface.getMacAddress().toBytes());
 
-		// this is the case for Arp Request timeout
-		if(arpEntry == null){
-			//ether.setDestinationMACAddress(inIface.getMacAddress().toBytes());
-			ether.setDestinationMACAddress(etherPacket.getSourceMAC().toBytes());
-			System.out.println("We have a null arp entry");
-		}
-		else{
-			ether.setDestinationMACAddress(arpEntry.getMac().toBytes());
-		}
+        // If no gateway, then nextHop is IP destination
+        int nextHop = bestMatch.getGatewayAddress();
+        if (0 == nextHop)
+        { nextHop = dstAddr; }
 
-		//Update IP header
-		ip.setTtl((byte) 64);
-		ip.setProtocol(IPv4.PROTOCOL_ICMP);
-		ip.setSourceAddress(inIface.getIpAddress());
-		ip.setDestinationAddress(ipPacket.getSourceAddress());
+        // Set destination MAC address in Ethernet header
+        ArpEntry arpEntry = this.arpCache.lookup(nextHop);
+        if (null == arpEntry)
+        { return; }
+        etherPacket.setDestinationMACAddress(arpEntry.getMac().toBytes());
+        
+        this.sendPacket(etherPacket, outIface);
+    }
 
-		//Update the data
-		if(type == TYPE_ECHO_REPLY){
-			System.out.println("does the type ever equal an echo reply?");
-			ICMP icmpPacket = (ICMP)ipPacket.getPayload();
-			icmp = icmpPacket;	
-			//special case for echo reply
-			ip.setSourceAddress(ipPacket.getDestinationAddress());
-			System.out.println("ipPacket destination = " + ipPacket.getDestinationAddress());
-		}
-		else{
-			byte headerLength = ipPacket.getHeaderLength();
-			ipPacket.resetChecksum();
-			byte ipInfo[] = ipPacket.serialize();
-			byte padding[] = {0, 0, 0, 0}; 
-			byte dataPayload[] = new byte[(byte)padding.length + (byte)(headerLength * 4) + (byte) 8];
+	
 
-			for(int i = 0; i < dataPayload.length; i++){
-				if(i < padding.length){
-					dataPayload[i] = padding[i];
-				}
-				else{
-					dataPayload[i] = ipInfo[i-padding.length];
-				}
+	public void handle_Arp_Packet(Ethernet etherPacket, Iface inIface) {
+		ARP arpPacket = (ARP) etherPacket.getPayload();
+		int targetIp = ByteBuffer.wrap(arpPacket.getTargetProtocolAddress()).getInt();
+
+		// if an ARP packet is an ARP request, generate ARP replies
+		if (arpPacket.getOpCode() == ARP.OP_REQUEST) {
+			System.out.println("We have an ARP Request");
+			int dstIP = IPv4.toIPv4Address(arpPacket.getSenderProtocolAddress()); // Destination IP
+			MACAddress dstMAC = MACAddress.valueOf(arpPacket.getSenderHardwareAddress()); // Destination MAC address
+			arpCache.insert(dstMAC, dstIP);
+			// only respond to ARP requests whose target IP equals IP of interface on which
+			// the ARP request was received.
+			if (targetIp == inIface.getIpAddress()) {
+
+				Ethernet ether = new Ethernet();
+				ARP arp_Replies = new ARP();
+				ether.setPayload(arp_Replies);
+
+				// populate the fields in the Ethernet header
+				ether.setEtherType(Ethernet.TYPE_ARP); // EtherType
+				ether.setSourceMACAddress(inIface.getMacAddress().toBytes()); // Source MAC
+				ether.setDestinationMACAddress(etherPacket.getSourceMACAddress()); // Destination MAC
+
+				// populate the fields in the ARP Header
+				arp_Replies.setHardwareType(ARP.HW_TYPE_ETHERNET); // Hardware type
+				arp_Replies.setProtocolType(ARP.PROTO_TYPE_IP); // Protocol type
+				arp_Replies.setHardwareAddressLength((byte)Ethernet.DATALAYER_ADDRESS_LENGTH); // Hardware
+																											// address
+																											// length
+				arp_Replies.setProtocolAddressLength((byte) 4); // Protocol address length
+				arp_Replies.setOpCode(ARP.OP_REPLY); // Opcode
+				arp_Replies.setSenderHardwareAddress(inIface.getMacAddress().toBytes()); // Sender hardware address
+				arp_Replies.setSenderProtocolAddress(inIface.getIpAddress()); // Sender protocol address
+				arp_Replies.setTargetHardwareAddress(arpPacket.getSenderHardwareAddress()); // Target hardware address
+				arp_Replies.setTargetProtocolAddress(arpPacket.getSenderProtocolAddress()); // Target protocol address
+
+				ether.resetChecksum();
+				sendPacket(ether, inIface);
 			}
-			data.setData(dataPayload);
+		} else if (arpPacket.getOpCode() == ARP.OP_REPLY) { // Generate ARP requests
+
+			int dstIP = IPv4.toIPv4Address(arpPacket.getSenderProtocolAddress()); // Destination IP
+			MACAddress dstMAC = MACAddress.valueOf(arpPacket.getSenderHardwareAddress()); // Destination MAC address
+
+			// insert arpCache entry for the corresponding ARP reply
+			arpCache.insert(dstMAC, dstIP);
+
+			// dequeue any waiting packets, fill in the correct destination MAC address
+			UnknownQueue foundHost = Arp_map.get(dstIP);
+			if (foundHost != null) {
+				// cancel any pending arp timer tasks since we got the information we needed
+				foundHost.getArpTask().cancel();
+				// remove the scheduled tasks from the timer
+				timer.purge();
+				// send those packets out the interface on which the ARP reply arrived
+				Queue<Ethernet> messages = foundHost.getMessages();
+				for (Ethernet msg : messages) {
+					System.out.println("Found the host! Send packets.");
+					msg.setDestinationMACAddress(dstMAC.toBytes());
+					// Find OutIface
+					IPv4 ipPacket = (IPv4) msg.getPayload();
+					int dstAddr = ipPacket.getDestinationAddress();
+					// Find matching route table entry
+					RouteEntry match = this.routeTable.lookup(dstAddr);
+					// Send packet
+					sendPacket(msg, match.getInterface());
+				}
+				Arp_map.remove(dstIP);
+			}
 		}
+	}
 
-		//Update ICMP header
-		icmp.setIcmpCode(code);
-		icmp.setIcmpType(type);
+	public Ethernet gen_Arp_Request(int nextHop, Iface outIface) {
+		//byte[] broadcast = { (byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff };
+		byte[] empty = { 0, 0, 0, 0, 0, 0 };
 
-		icmp.resetChecksum();
-		ip.resetChecksum();
+		Ethernet ether = new Ethernet();
+		ARP arp_Requests = new ARP();
+		ether.setPayload(arp_Requests);
+
+		// Populate the fields in the Ethernet header
+		ether.setEtherType(Ethernet.TYPE_ARP);
+		ether.setSourceMACAddress(outIface.getMacAddress().toBytes());
+		ether.setDestinationMACAddress(BROADCAST); // Set to the broadcast MAC address FF:FF:FF:FF:FF:FF
+
+		// Set the fields for the ARP Header
+		arp_Requests.setHardwareType(ARP.HW_TYPE_ETHERNET);
+		arp_Requests.setProtocolType(ARP.PROTO_TYPE_IP);
+		arp_Requests.setHardwareAddressLength((byte)Ethernet.DATALAYER_ADDRESS_LENGTH);
+		arp_Requests.setProtocolAddressLength((byte) 4);
+		arp_Requests.setOpCode(ARP.OP_REQUEST); // Set to ARP.OP_REQUEST
+		arp_Requests.setSenderHardwareAddress(outIface.getMacAddress().toBytes());
+		arp_Requests.setSenderProtocolAddress(outIface.getIpAddress());
+		arp_Requests.setTargetHardwareAddress(empty); // Set to 0
+		arp_Requests.setTargetProtocolAddress(nextHop);
+
 		ether.resetChecksum();
-		System.out.println("send ICMP Packet");
-		sendPacket(ether, inIface);
-		System.out.println("ICMP sent!!");
+
+		return ether;
+	}
+
+	private void handleNoEntryMatch(Ethernet etherPacket, Iface inIface, IPv4 ipkt, RouteEntry match, int nextHop) {
+
+		// if our map already has the destination address in it add message to queue
+		if (Arp_map.containsKey(ipkt.getDestinationAddress())) {
+			// need to add the message to our queue
+			System.out.println("Adding new message to existing queue");
+			UnknownQueue unknownHost = Arp_map.get(ipkt.getDestinationAddress());
+			unknownHost.getMessages().add(etherPacket);
+		}
+		// generate ARP request and broadcast it on all non-incoming interfaces
+		else {
+			int timeBeforeResend = 1000; // 1 second
+			Ethernet arpRequest = gen_Arp_Request(nextHop, inIface);
+
+			/* Construct new object */
+			ARPTask sendARPTask = new ARPTask(arpRequest, match.getInterface(), ipkt.getDestinationAddress());
+			UnknownQueue unknownHostInfo = new UnknownQueue(etherPacket, sendARPTask);
+
+			// get destination IP and add the corresponding UnknownQueue to the map
+			Arp_map.put(ipkt.getDestinationAddress(), unknownHostInfo);
+
+			// Schedule the task to go off in 1 second
+			timer.schedule(sendARPTask, timeBeforeResend, timeBeforeResend);
+
+			sendPacket(arpRequest, match.getInterface());
+		}
 	}
 
 	class ARPTask extends TimerTask {
@@ -702,44 +670,105 @@ public class Router extends Device
 		private Iface inIface;
 		private int dstIP;
 
-		public ARPTask(Ethernet ePacket, Iface i, int ip){
+		public ARPTask(Ethernet ePacket, Iface i, int ip) {
 			ether = ePacket;
 			dstIP = ip;
 			inIface = i;
 		}
+
 		@Override
 		public void run() {
 			System.out.println("Resend ARP Request");
-			checkIfContinueTryingToSendArpPacket(ether, inIface, dstIP);
+			checkArpRequestTimes(ether, inIface, dstIP);
 		}
 	}
-	
+
+	private void checkArpRequestTimes(Ethernet arp_Requests, Iface outIface, int dstIP) {
+		UnknownQueue unknownHost = Arp_map.get(dstIP);
+		// Send the message up to 3 times
+		if (unknownHost.getSentTime() < 3) {
+			unknownHost.incSentTime();
+			sendPacket(arp_Requests, outIface);
+		}
+		// If it has already been sent 3 times, don't reschedule the timer
+		else {
+			IPv4 ipPacket;
+			// cancel timertask
+			unknownHost.getArpTask().cancel();
+			// purge timer
+			timer.purge();
+			Queue<Ethernet> messages = unknownHost.getMessages();
+			System.out.println("size of queue" + messages.size());
+			// Ethernet msg;
+			for (Ethernet msg : messages) {
+				// Find InIface
+				ipPacket = (IPv4) msg.getPayload();
+				int dstAddr = ipPacket.getSourceAddress();
+				// Find matching route table entry
+				RouteEntry match = this.routeTable.lookup(dstAddr);
+				sendICMP(msg, match.getInterface(), ICMP_HOST_NOT_REACHABLE_TYPE, ICMP_HOST_NOT_REACHABLE_CODE);
+			}
+
+			// remove dstIP from map
+			Arp_map.remove(unknownHost);
+		}
+	}
+
 	class ExpireRouteEntryTask extends TimerTask {
-		private Router router;
-		private int dstAddr, maskAddr;
-		public ExpireRouteEntryTask(Router r, int dst, int mask){
-			router = r;
-			dstAddr = dst;
-			maskAddr = mask;
+		private int dst, mask;
+
+		public ExpireRouteEntryTask(int dst, int mask) {
+			this.dst = dst;
+			this.mask = mask;
 		}
 
 		@Override
 		public void run() {
-			router.expireRouteEntry(dstAddr, maskAddr);
+			ripTable.remove(dst);
+			routeTable.remove((dst & mask), mask);
 		}
 	}
-	
+
 	class RipBroadcastTask extends TimerTask {
 		private Router router;
 
-		public RipBroadcastTask(Router r){
+		public RipBroadcastTask(Router r) {
 			router = r;
 		}
+
 		@Override
 		public void run() {
 			router.broadcastRIP(RIPv2.COMMAND_RESPONSE);
 		}
 	}
+
+	public class UnknownQueue {
+		private Queue<Ethernet> messages;
+		private int sent_time;
+		private ARPTask arp_task;
+
+		public UnknownQueue(Ethernet packet, ARPTask task) {
+			messages = new LinkedList<Ethernet>();
+			messages.add(packet);
+			sent_time = 0;
+			arp_task = task;
+		}
+
+		public int getSentTime() {
+			return sent_time;
+		}
+
+		public void incSentTime() {
+			sent_time++;
+		}
+
+		public Queue<Ethernet> getMessages() {
+			return messages;
+		}
+
+		public ARPTask getArpTask() {
+			return arp_task;
+		}
+	}
+
 }
-
-
